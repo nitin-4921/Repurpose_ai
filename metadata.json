@@ -1,0 +1,6 @@
+{
+  "name": "RepurposeAI",
+  "description": "Show-notes and multi-platform repurposing agent for long-form video and podcast episodes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
