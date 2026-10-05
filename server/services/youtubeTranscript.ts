@@ -192,8 +192,134 @@ export async function fetchYouTubeMetadata(videoId: string, originalUrl: string)
 }
 
 /**
- * Primary transcript retrieval service using youtube-transcript package.
- * youtube-transcript offsets are in milliseconds; we convert to seconds.
+ * Fetch transcript via Supadata API — works from any cloud/datacenter IP.
+ * Returns null if SUPADATA_API_KEY is not set or if the request fails.
+ * Supadata offsets are in milliseconds; we convert to seconds.
+ */
+async function fetchViaSupadata(videoId: string): Promise<TranscriptItem[] | null> {
+  const apiKey = process.env.SUPADATA_API_KEY;
+  if (!apiKey || apiKey === 'your_supadata_api_key_here') {
+    console.log('[Transcript] SUPADATA_API_KEY not set — skipping Supadata');
+    return null;
+  }
+
+  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const endpoint = `https://api.supadata.ai/v1/youtube/transcript?url=${encodeURIComponent(videoUrl)}&text=false`;
+
+  console.log(`[Transcript] Trying Supadata API (cloud-safe)...`);
+  const res = await fetch(endpoint, {
+    headers: {
+      'x-api-key': apiKey,
+      'Accept': 'application/json',
+    },
+    signal: AbortSignal.timeout(20000),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    console.warn(`[Transcript] Supadata returned HTTP ${res.status}: ${body.substring(0, 120)}`);
+    return null;
+  }
+
+  const data = await res.json();
+
+  // Supadata returns { lang, content: [{ text, offset, duration }] }
+  const content = data?.content;
+  if (!Array.isArray(content) || content.length === 0) {
+    console.warn(`[Transcript] Supadata returned empty content for ${videoId}`);
+    return null;
+  }
+
+  const items: TranscriptItem[] = content.map((seg: any) => {
+    const startSec = (seg.offset ?? 0) / 1000;
+    const durationSec = (seg.duration ?? 2000) / 1000;
+    return {
+      text: (seg.text ?? '').replace(/\n/g, ' ').trim(),
+      start: startSec,
+      duration: durationSec,
+      timestamp: formatSecondsToTimestamp(startSec),
+      offset: startSec,
+    };
+  });
+
+  console.log(`[Transcript] Supadata returned ${items.length} segments (lang: ${data.lang ?? 'unknown'})`);
+  return items;
+}
+
+/**
+ * Fetch transcript via youtube-transcript npm package.
+ * Works on local/residential IPs but is blocked by YouTube on cloud/datacenter IPs.
+ */
+async function fetchViaPackage(videoId: string): Promise<TranscriptItem[] | null> {
+  const langPreferences = ['en', 'en-US', 'en-GB'];
+
+  for (const lang of langPreferences) {
+    try {
+      console.log(`[Transcript] Trying youtube-transcript package (lang: ${lang})`);
+      const raw = await YoutubeTranscript.fetchTranscript(videoId, { lang });
+      if (raw && raw.length > 0) {
+        console.log(`[Transcript] youtube-transcript succeeded (${raw.length} segments, lang: ${lang})`);
+        return raw.map((seg) => {
+          const startSec = (seg.offset ?? 0) / 1000;
+          const durationSec = (seg.duration ?? 2000) / 1000;
+          return {
+            text: seg.text.replace(/\n/g, ' ').trim(),
+            start: startSec,
+            duration: durationSec,
+            timestamp: formatSecondsToTimestamp(startSec),
+            offset: startSec,
+          };
+        });
+      }
+    } catch (err: any) {
+      const msg: string = err?.message || String(err);
+      // If captions are definitively disabled, no point trying other langs
+      if (
+        msg.toLowerCase().includes('disabled') ||
+        msg.toLowerCase().includes('no captions') ||
+        msg.toLowerCase().includes('could not find')
+      ) {
+        console.warn(`[Transcript] youtube-transcript: captions unavailable for ${videoId}`);
+        return null;
+      }
+      console.warn(`[Transcript] youtube-transcript failed (lang=${lang}): ${msg.substring(0, 100)}`);
+    }
+  }
+
+  // One last try without language preference
+  try {
+    const raw = await YoutubeTranscript.fetchTranscript(videoId);
+    if (raw && raw.length > 0) {
+      console.log(`[Transcript] youtube-transcript default track succeeded (${raw.length} segments)`);
+      return raw.map((seg) => {
+        const startSec = (seg.offset ?? 0) / 1000;
+        const durationSec = (seg.duration ?? 2000) / 1000;
+        return {
+          text: seg.text.replace(/\n/g, ' ').trim(),
+          start: startSec,
+          duration: durationSec,
+          timestamp: formatSecondsToTimestamp(startSec),
+          offset: startSec,
+        };
+      });
+    }
+  } catch (err: any) {
+    console.warn(`[Transcript] youtube-transcript default fallback failed: ${err?.message?.substring(0, 100)}`);
+  }
+
+  return null;
+}
+
+/**
+ * Primary transcript retrieval service.
+ *
+ * Strategy:
+ *   1. Curated sample (instant, no network)
+ *   2. Supadata API — works on cloud/datacenter IPs (requires SUPADATA_API_KEY)
+ *   3. youtube-transcript npm package — works on local/residential IPs
+ *
+ * Set SUPADATA_API_KEY in your environment for deployed instances.
+ * Get a free key (100 req/month) at https://supadata.ai — no credit card needed.
  */
 export async function fetchYouTubeTranscript(
   videoId: string
@@ -206,7 +332,7 @@ export async function fetchYouTubeTranscript(
 }> {
   console.log(`[Transcript] Attempting transcript retrieval for: ${videoId}`);
 
-  // 1. Check curated samples
+  // 1. Curated samples — instant, no network call needed
   if (SAMPLE_EPISODES[videoId]) {
     const sample = SAMPLE_EPISODES[videoId];
     console.log(`[Transcript] Using curated transcript for sample: ${videoId}`);
@@ -220,68 +346,31 @@ export async function fetchYouTubeTranscript(
     return processTranscriptItems(items, 'curated_sample');
   }
 
-  // 2. Primary: youtube-transcript npm package (most reliable, no third-party dependency)
-  //    Try English manual → English auto-generated → any available language
-  const langPreferences = ['en', 'en-US', 'en-GB'];
-
-  for (const lang of langPreferences) {
-    try {
-      console.log(`[Transcript] Trying youtube-transcript package (lang: ${lang})`);
-      const raw = await YoutubeTranscript.fetchTranscript(videoId, { lang });
-      if (raw && raw.length > 0) {
-        console.log(`[Transcript] Transcript track found via youtube-transcript! (${raw.length} segments, lang: ${lang})`);
-        // youtube-transcript returns offset in milliseconds — convert to seconds
-        const items: TranscriptItem[] = raw.map((seg) => {
-          const startSec = (seg.offset ?? 0) / 1000;
-          const durationSec = (seg.duration ?? 2000) / 1000;
-          return {
-            text: seg.text.replace(/\n/g, ' ').trim(),
-            start: startSec,
-            duration: durationSec,
-            timestamp: formatSecondsToTimestamp(startSec),
-            offset: startSec,
-          };
-        });
-        console.log(`[Transcript] Retrieved ${items.length} segments`);
-        return processTranscriptItems(items, 'youtube-transcript-pkg');
-      }
-    } catch (err: any) {
-      // TooManyRequestsError or TranscriptDisabledError etc.
-      const msg: string = err?.message || String(err);
-      if (msg.toLowerCase().includes('disabled') || msg.toLowerCase().includes('no captions')) {
-        // Captions definitively disabled on this video — no point trying other langs
-        console.warn(`[Transcript] Captions disabled for ${videoId}: ${msg}`);
-        break;
-      }
-      console.warn(`[Transcript] youtube-transcript failed for lang=${lang}: ${msg}`);
-    }
-  }
-
-  // 3. Fallback: try without specifying language (lets the package pick the default track)
+  // 2. Supadata API — cloud-safe, works from any datacenter IP
   try {
-    console.log(`[Transcript] Trying youtube-transcript without language preference`);
-    const raw = await YoutubeTranscript.fetchTranscript(videoId);
-    if (raw && raw.length > 0) {
-      console.log(`[Transcript] Default language transcript retrieved (${raw.length} segments)`);
-      const items: TranscriptItem[] = raw.map((seg) => {
-        const startSec = (seg.offset ?? 0) / 1000;
-        const durationSec = (seg.duration ?? 2000) / 1000;
-        return {
-          text: seg.text.replace(/\n/g, ' ').trim(),
-          start: startSec,
-          duration: durationSec,
-          timestamp: formatSecondsToTimestamp(startSec),
-          offset: startSec,
-        };
-      });
-      return processTranscriptItems(items, 'youtube-transcript-pkg-default');
+    const supadataItems = await fetchViaSupadata(videoId);
+    if (supadataItems && supadataItems.length > 0) {
+      return processTranscriptItems(supadataItems, 'supadata');
     }
-  } catch (fallbackErr: any) {
-    console.warn(`[Transcript] youtube-transcript default fallback failed: ${fallbackErr?.message}`);
+  } catch (err: any) {
+    console.warn(`[Transcript] Supadata error: ${err?.message?.substring(0, 100)}`);
   }
 
-  // 4. If all strategies failed, check if video actually exists before reporting NO_TRANSCRIPT
-  console.error(`[Transcript] Retrieval failed for video ID: ${videoId}`);
+  // 3. youtube-transcript package — works locally, blocked on cloud IPs
+  try {
+    const pkgItems = await fetchViaPackage(videoId);
+    if (pkgItems && pkgItems.length > 0) {
+      return processTranscriptItems(pkgItems, 'youtube-transcript-pkg');
+    }
+  } catch (err: any) {
+    console.warn(`[Transcript] youtube-transcript package error: ${err?.message?.substring(0, 100)}`);
+  }
+
+  // All strategies exhausted
+  console.error(`[Transcript] All retrieval strategies failed for: ${videoId}`);
+  console.error(`[Transcript] Reason: No captions/transcript available or all services blocked`);
+
+  // Check whether video actually exists before blaming captions
   try {
     const oembedCheck = await fetch(
       `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}&format=json`,
@@ -294,7 +383,6 @@ export async function fetchYouTubeTranscript(
     if (checkErr instanceof YouTubePipelineError) throw checkErr;
   }
 
-  console.error(`[Transcript] Reason: No captions/transcript available for ${videoId}`);
   throw new YouTubePipelineError(
     'NO_TRANSCRIPT',
     'No transcript or captions are available for this video.',
